@@ -1,22 +1,3 @@
-data/
-.venv/
-.kaggle/
-# Virtual environment
-.venv/
-
-# Data files
-data/
-*.zip
-
-# Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# OS
 .DS_Store
+UniqueProject/
