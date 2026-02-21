@@ -1,19 +1,26 @@
 """
-LightGBM model to predict state label from vital signs.
+LSTM model to predict state label from vital signs (row-level classification).
+Maximizes competition expected score.
+
 Output: predictions.csv with columns: ID, predicted_label
 """
 
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-from lightgbm import LGBMClassifier
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
-# Paths
-DATA_DIR = Path(__file__).resolve().parent / "data"
-TRAIN_PATH = DATA_DIR / "train_data.csv"
-TEST_PATH = DATA_DIR / "holdout_data.csv"
-OUTPUT_PATH = DATA_DIR / "predictions.csv"
+# =========================
+# CONFIG
+# =========================
+BATCH_SIZE = 256
+EPOCHS = 15
+LR = 3e-4
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 FEATURE_COLS = [
     "heart_rate",
@@ -24,89 +31,158 @@ FEATURE_COLS = [
 ]
 
 TARGET_COL = "label"
-ID_COL_CSV = "encounter_id"
-OUTPUT_ID_COL = "ID"
-OUTPUT_LABEL_COL = "predicted_label"
 
+DATA_DIR = Path(__file__).resolve().parent / "data"
+TRAIN_PATH = DATA_DIR / "train_data.csv"
+TEST_PATH = DATA_DIR / "holdout_data.csv"
+OUTPUT_PATH = DATA_DIR / "predictions.csv"
 
-def remove_fully_null_feature_rows(df):
-    """Remove rows where ALL feature columns are null."""
-    mask = ~df[FEATURE_COLS].isnull().all(axis=1)
-    return df.loc[mask].reset_index(drop=True)
+NUM_CLASSES = 4
 
+# =========================
+# COMPETITION SCORING MATRIX
+# =========================
+SCORE_MATRIX = torch.tensor([
+    [0,  -2,  -2,  -5],
+    [-3,  2,  -1,  -5],
+    [-10, -3,  3,  -5],
+    [-15, -10, -5,  5]
+], dtype=torch.float32).to(DEVICE)
 
-def drop_empty_test_rows(df):
-    """Drop rows with missing encounter_id or all features null."""
-    if ID_COL_CSV in df.columns:
-        df = df.dropna(subset=[ID_COL_CSV])
-        df = df.loc[df[ID_COL_CSV].astype(str).str.strip() != ""]
-    df = remove_fully_null_feature_rows(df)
-    return df.reset_index(drop=True)
+# =========================
+# DATASET
+# =========================
+class RowDataset(Dataset):
+    def __init__(self, X, y=None):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long) if y is not None else None
 
+    def __len__(self):
+        return len(self.X)
 
-def load_and_prepare_train(path: Path):
-    df = pd.read_csv(path)
-    df = remove_fully_null_feature_rows(df)
+    def __getitem__(self, idx):
+        if self.y is not None:
+            return self.X[idx], self.y[idx]
+        return self.X[idx]
 
-    X = df[FEATURE_COLS]
-    y = df[TARGET_COL]
+# =========================
+# MODEL
+# =========================
+class SimpleMLP(nn.Module):
+    def __init__(self, input_size=5):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_size, 128),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, NUM_CLASSES)
+        )
 
-    # LightGBM can handle NaNs, but imputation keeps consistency
-    imputer = SimpleImputer(strategy="median")
-    X_imputed = imputer.fit_transform(X)
+    def forward(self, x):
+        return self.net(x)
 
-    return X_imputed, y, imputer
+# =========================
+# CUSTOM COMPETITION LOSS
+# =========================
+class CompetitionLoss(nn.Module):
+    def __init__(self, score_matrix):
+        super().__init__()
+        self.score_matrix = score_matrix
 
+    def forward(self, logits, targets):
+        probs = torch.softmax(logits, dim=1)
+        score_rows = self.score_matrix[targets]
+        expected_score = torch.sum(probs * score_rows, dim=1)
+        return -expected_score.mean()
 
-def load_and_prepare_test(path: Path, imputer):
-    df = pd.read_csv(path)
+# =========================
+# TRAINING LOOP
+# =========================
+def train_epoch(model, loader, optimizer, criterion):
+    model.train()
+    total_loss = 0
 
-    # Ensure ID exists
-    if "ID" not in df.columns:
-        df["ID"] = np.arange(1, len(df) + 1, dtype=int)
+    for X, y in loader:
+        X, y = X.to(DEVICE), y.to(DEVICE)
 
-    df = drop_empty_test_rows(df)
+        optimizer.zero_grad()
+        outputs = model(X)
+        loss = criterion(outputs, y)
+        loss.backward()
+        optimizer.step()
 
-    X = df[FEATURE_COLS]
-    X_imputed = imputer.transform(X)
+        total_loss += loss.item()
 
-    return X_imputed, df
+    return total_loss / len(loader)
 
-
+# =========================
+# MAIN
+# =========================
 def main():
-    print("Loading training data...")
-    X_train, y_train, imputer = load_and_prepare_train(TRAIN_PATH)
 
-    print("Training LightGBM (multiclass)...")
+    print("Loading data...")
+    train_df = pd.read_csv(TRAIN_PATH)
+    test_df = pd.read_csv(TEST_PATH)
 
-    model = LGBMClassifier(
-        objective="multiclass",
-        num_class=len(np.unique(y_train)),
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=-1,
-        random_state=42,
-        class_weight="balanced"
-    )
+    # Remove rows with all features null
+    train_df = train_df[~train_df[FEATURE_COLS].isnull().all(axis=1)]
+    test_df = test_df[~test_df[FEATURE_COLS].isnull().all(axis=1)]
 
-    model.fit(X_train, y_train)
+    print("Raw label distribution:")
+    print(train_df[TARGET_COL].value_counts())
 
-    print("Loading test data...")
-    X_test, test_df = load_and_prepare_test(TEST_PATH, imputer)
+    # Impute
+    imputer = SimpleImputer(strategy="median")
+    X_train = imputer.fit_transform(train_df[FEATURE_COLS])
+    X_test = imputer.transform(test_df[FEATURE_COLS])
 
-    print(f"Clean test samples: {len(test_df)}")
+    # Scale
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
 
-    predicted_label_indices = model.predict(X_test).astype(int)
+    y_train = train_df[TARGET_COL].astype(int).values
+
+    print("Processed class distribution:",
+          np.bincount(y_train, minlength=NUM_CLASSES))
+
+    train_dataset = RowDataset(X_train, y_train)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    model = SimpleMLP(input_size=len(FEATURE_COLS)).to(DEVICE)
+    criterion = CompetitionLoss(SCORE_MATRIX)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+    print("Training...")
+    for epoch in range(EPOCHS):
+        loss = train_epoch(model, train_loader, optimizer, criterion)
+        print(f"Epoch {epoch+1}/{EPOCHS} - Expected Score Loss: {loss:.4f}")
+
+    print("Predicting test set...")
+    model.eval()
+
+    with torch.no_grad():
+        test_tensor = torch.tensor(X_test, dtype=torch.float32).to(DEVICE)
+        logits = model(test_tensor)
+        probs = torch.softmax(logits, dim=1)
+
+        expected_scores = probs @ SCORE_MATRIX.T
+        predicted = torch.argmax(expected_scores, dim=1).cpu().numpy()
 
     predictions_df = pd.DataFrame({
-        OUTPUT_ID_COL: test_df["ID"],
-        OUTPUT_LABEL_COL: predicted_label_indices
+        "ID": np.arange(1, len(predicted) + 1),
+        "predicted_label": predicted
     })
 
     predictions_df.to_csv(OUTPUT_PATH, index=False)
 
-    print(f"Saved predictions to {OUTPUT_PATH}")
-    print(f"Prediction distribution: {dict(zip(*np.unique(predicted_label_indices, return_counts=True)))}")
+    print(f"Saved predictions with {len(predictions_df)} rows.")
+    print("Prediction distribution:",
+          dict(zip(*np.unique(predicted, return_counts=True))))
 
 
 if __name__ == "__main__":
