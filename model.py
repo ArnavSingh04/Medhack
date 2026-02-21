@@ -1,14 +1,13 @@
 """
-Logistic regression model to predict state label from vital signs.
-Output: predictions.csv with only patient_id and label
+LightGBM model to predict state label from vital signs.
+Output: predictions.csv with columns: ID, predicted_label
 """
 
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
+from lightgbm import LGBMClassifier
 
 # Paths
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -23,8 +22,8 @@ FEATURE_COLS = [
     "respiratory_rate",
     "oxygen_saturation",
 ]
+
 TARGET_COL = "label"
-# Test CSV has encounter_id; submission must have column "ID" (1-based index)
 ID_COL_CSV = "encounter_id"
 OUTPUT_ID_COL = "ID"
 OUTPUT_LABEL_COL = "predicted_label"
@@ -37,75 +36,71 @@ def remove_fully_null_feature_rows(df):
 
 
 def drop_empty_test_rows(df):
-    """Drop rows with missing encounter_id or all features null (no empty rows in predictions)."""
-    # Drop rows with null/empty encounter_id
+    """Drop rows with missing encounter_id or all features null."""
     if ID_COL_CSV in df.columns:
         df = df.dropna(subset=[ID_COL_CSV])
         df = df.loc[df[ID_COL_CSV].astype(str).str.strip() != ""]
-    # Drop rows where all feature columns are null
     df = remove_fully_null_feature_rows(df)
     return df.reset_index(drop=True)
 
 
 def load_and_prepare_train(path: Path):
     df = pd.read_csv(path)
-
     df = remove_fully_null_feature_rows(df)
 
     X = df[FEATURE_COLS]
     y = df[TARGET_COL]
 
+    # LightGBM can handle NaNs, but imputation keeps consistency
     imputer = SimpleImputer(strategy="median")
     X_imputed = imputer.fit_transform(X)
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_imputed)
-
-    return X_scaled, y, imputer, scaler
+    return X_imputed, y, imputer
 
 
-def load_and_prepare_test(path: Path, imputer, scaler):
+def load_and_prepare_test(path: Path, imputer):
     df = pd.read_csv(path)
 
-    # Ensure we have an ID column from test data (1-based row index if not present)
+    # Ensure ID exists
     if "ID" not in df.columns:
         df["ID"] = np.arange(1, len(df) + 1, dtype=int)
 
-    # Drop empty rows (missing id or all-null features) before creating predictions
     df = drop_empty_test_rows(df)
 
     X = df[FEATURE_COLS]
-
     X_imputed = imputer.transform(X)
-    X_scaled = scaler.transform(X_imputed)
 
-    return X_scaled, df
+    return X_imputed, df
 
 
 def main():
     print("Loading training data...")
-    X_train, y_train, imputer, scaler = load_and_prepare_train(TRAIN_PATH)
+    X_train, y_train, imputer = load_and_prepare_train(TRAIN_PATH)
 
-    print("Training logistic regression...")
-    model = LogisticRegression(
-        max_iter=1000,
+    print("Training LightGBM (multiclass)...")
+
+    model = LGBMClassifier(
+        objective="multiclass",
+        num_class=len(np.unique(y_train)),
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=-1,
         random_state=42,
-        solver="lbfgs",
         class_weight="balanced"
     )
+
     model.fit(X_train, y_train)
 
     print("Loading test data...")
-    X_test, test_df = load_and_prepare_test(TEST_PATH, imputer, scaler)
+    X_test, test_df = load_and_prepare_test(TEST_PATH, imputer)
 
     print(f"Clean test samples: {len(test_df)}")
 
     predicted_label_indices = model.predict(X_test).astype(int)
 
-    # Same format as requested: ID from test data, predicted_label
     predictions_df = pd.DataFrame({
-        "ID": test_df["ID"],
-        "predicted_label": predicted_label_indices
+        OUTPUT_ID_COL: test_df["ID"],
+        OUTPUT_LABEL_COL: predicted_label_indices
     })
 
     predictions_df.to_csv(OUTPUT_PATH, index=False)
