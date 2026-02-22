@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "scikit-learn>=1.5.0",
     "ipykernel>=7.2.0",
+    "lightgbm>=4.0.0",
     "jupyter>=1.1.1",
     "kaggle>=2.0.0",
     "matplotlib>=3.10.8",
@@ -16,4 +17,14 @@ dependencies = [
     "seaborn>=0.13.2",
     "statsmodels>=0.14.6",
     "torch>=2.2.0",
+    "optuna>=4.7.0",
+    "optuna-integration>=4.7.0",
+    "xgboost>=2.0.0",
+    "catboost>=1.2.0",
+    "fastparquet>=2024.2.0",
+    "scipy>=1.11.0",
 ]
+
+[tool.uv]
+# Ensure resolution includes wheels for macOS Intel (torch 2.10+ drops x86_64 support)
+required-environments = ["sys_platform == 'darwin' and platform_machine == 'x86_64'"]

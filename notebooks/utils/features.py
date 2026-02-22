@@ -8,9 +8,12 @@ features (EDA-informed, leakage-safe).
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 import pandas as pd
 from scipy import stats
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -135,7 +138,17 @@ class FeatureEngineer:
     def add_lag_features(
         self, df: pd.DataFrame
     ) -> tuple[pd.DataFrame, list[str]]:
-        """Lag1..lag{n_lags} per vital, warmup filled with encounter median."""
+        """Lag1..lag{n_lags} per vital.
+
+        Warmup NaNs are backfilled with the encounter's first observation
+        (not median).  This ensures derivative features are exactly 0 during
+        warmup ("no change detected yet") rather than noisy deviations from
+        the encounter median.
+
+        Also adds ``warmup_progress`` (0 → 1 over the first ``n_lags`` rows)
+        so the model can learn to discount derivative/rolling features when
+        the lag window is still filling.
+        """
         out = df.sort_values(
             [self.encounter_id_col, "timestamp"]
         ).reset_index(drop=True).copy()
@@ -143,19 +156,29 @@ class FeatureEngineer:
             g = out.groupby(self.encounter_id_col)[col]
             for lag in range(1, self.n_lags + 1):
                 out[f"{col}_lag{lag}"] = g.shift(lag)
+
+        # Backfill: use encounter's first observation (not median)
         for col in self.vital_cols:
-            enc_median = out.groupby(self.encounter_id_col)[col].transform(
-                "median"
+            first_val = out.groupby(self.encounter_id_col)[col].transform(
+                "first"
             )
             for lag in range(1, self.n_lags + 1):
                 lag_col = f"{col}_lag{lag}"
-                out[lag_col] = out[lag_col].fillna(enc_median)
+                out[lag_col] = out[lag_col].fillna(first_val)
+
+        # warmup_progress: fraction of the lag window with real observations
+        # Row 0 → 0/n_lags, Row 1 → 1/n_lags, ..., Row n_lags → 1.0
+        row_in_enc = out.groupby(self.encounter_id_col).cumcount()
+        out["warmup_progress"] = (
+            row_in_enc.clip(upper=self.n_lags) / self.n_lags
+        ).astype(np.float32)
+
         lag_cols = [
             f"{col}_lag{lag}"
             for col in self.vital_cols
             for lag in range(1, self.n_lags + 1)
         ]
-        return out, lag_cols
+        return out, lag_cols + ["warmup_progress"]
 
     def add_spectral_features(
         self,
@@ -184,14 +207,15 @@ class FeatureEngineer:
                 ]
             )
             window = stacked.astype(np.float64)
-            # Impute window NaNs with encounter median
-            encounter_median = (
+            # Impute window NaNs with encounter's first value (not median)
+            # to avoid artificial variance in warmup rows
+            encounter_first = (
                 out.groupby(self.encounter_id_col)[col]
-                .transform("median")
+                .transform("first")
                 .values
             )
             window = np.where(
-                np.isnan(window), encounter_median[:, np.newaxis], window
+                np.isnan(window), encounter_first[:, np.newaxis], window
             )
             # Compute spectral features
             n = window.shape[1]
@@ -516,6 +540,93 @@ class FeatureEngineer:
         )
         return out, list(self.PRIOR_LABEL_COLS)
 
+    # ------------------------------------------------------------------
+    # Clinical alert features
+    # ------------------------------------------------------------------
+
+    def add_clinical_alert_features(
+        self, df: pd.DataFrame
+    ) -> tuple[pd.DataFrame, list[str]]:
+        """Binary flags for clinically dangerous vital sign ranges."""
+        out = df.copy()
+        out["hr_tachycardia"] = (out["heart_rate"] > 100).astype(float)
+        out["hr_bradycardia"] = (out["heart_rate"] < 60).astype(float)
+        out["hr_critical_high"] = (out["heart_rate"] > 150).astype(float)
+        out["bp_hypotension"] = (out["systolic_bp"] < 90).astype(float)
+        out["bp_hypertension"] = (out["systolic_bp"] > 180).astype(float)
+        out["spo2_low"] = (out["oxygen_saturation"] < 92).astype(float)
+        out["spo2_critical"] = (out["oxygen_saturation"] < 88).astype(float)
+        out["rr_tachypnea"] = (out["respiratory_rate"] > 22).astype(float)
+        out["rr_bradypnea"] = (out["respiratory_rate"] < 8).astype(float)
+        alert_flags = [
+            "hr_tachycardia", "hr_bradycardia", "bp_hypotension",
+            "spo2_low", "rr_tachypnea", "rr_bradypnea",
+        ]
+        out["n_active_alerts"] = out[alert_flags].sum(axis=1)
+        cols = [
+            "hr_tachycardia", "hr_bradycardia", "hr_critical_high",
+            "bp_hypotension", "bp_hypertension",
+            "spo2_low", "spo2_critical",
+            "rr_tachypnea", "rr_bradypnea",
+            "n_active_alerts",
+        ]
+        return out, cols
+
+    # ------------------------------------------------------------------
+    # Interaction features (vital x demographic)
+    # ------------------------------------------------------------------
+
+    def add_interaction_features(
+        self, df: pd.DataFrame
+    ) -> tuple[pd.DataFrame, list[str]]:
+        """Cross vital signs with patient demographics."""
+        out = df.copy()
+        cols: list[str] = []
+        if "is_elderly" in out.columns:
+            for v in self.vital_cols:
+                c = f"{v}_x_elderly"
+                out[c] = out[v] * out["is_elderly"]
+                cols.append(c)
+        if "is_child" in out.columns:
+            for v in self.vital_cols:
+                c = f"{v}_x_child"
+                out[c] = out[v] * out["is_child"]
+                cols.append(c)
+        if "comorbidity_count" in out.columns:
+            for v in ["heart_rate", "oxygen_saturation", "systolic_bp"]:
+                c = f"{v}_x_comorbidity"
+                out[c] = out[v] * out["comorbidity_count"]
+                cols.append(c)
+        if "on_cardiac_meds" in out.columns:
+            out["hr_x_cardiac_meds"] = out["heart_rate"] * out["on_cardiac_meds"]
+            cols.append("hr_x_cardiac_meds")
+        if "reason_risk_tier" in out.columns and "shock_index" in out.columns:
+            out["shock_x_risk"] = out["shock_index"] * out["reason_risk_tier"]
+            cols.append("shock_x_risk")
+        return out, cols
+
+    # ------------------------------------------------------------------
+    # Higher-order derivatives
+    # ------------------------------------------------------------------
+
+    def add_higher_order_derivatives(
+        self, df: pd.DataFrame
+    ) -> tuple[pd.DataFrame, list[str]]:
+        """Jerk (3rd derivative) for sudden vital changes."""
+        out = df.copy()
+        cols: list[str] = []
+        for v in self.vital_cols:
+            if f"{v}_lag3" in out.columns:
+                c = f"{v}_jerk"
+                out[c] = (
+                    out[v]
+                    - 3 * out[f"{v}_lag1"]
+                    + 3 * out[f"{v}_lag2"]
+                    - out[f"{v}_lag3"]
+                )
+                cols.append(c)
+        return out, cols
+
     def add_patient_features(
         self,
         df: pd.DataFrame,
@@ -676,54 +787,91 @@ class FeatureEngineer:
         test_raw: pd.DataFrame,
         holdout_raw: pd.DataFrame,
         patients: pd.DataFrame,
+        include_prior_labels: bool = False,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
         """
         Full pipeline: impute → lag → derivative → rolling → multiscale rolling
-        → derived vitals → temporal → ECG → prior labels → patient features.
+        → derived vitals → temporal → ECG → (optional) prior labels → patient
+        features → clinical alerts → interactions → higher-order derivatives.
+
+        Args:
+            include_prior_labels: If ``False`` (default), prior-label features
+                are **not** generated.  These leak label information and are
+                all-zero on holdout, causing the model to predict everything
+                as class 0.
+
         Returns (train, test, holdout, feature_cols).
         """
+        logger.info("Creating features: impute_vitals (neighbour + median fallback)")
         train = self.impute_vitals(train_raw)
         test = self.impute_vitals(test_raw)
         holdout = self.impute_vitals(holdout_raw)
 
+        logger.info("Creating features: lag (vital lags 1..n + warmup_progress)")
         train, lag_cols = self.add_lag_features(train)
         test, _ = self.add_lag_features(test)
         holdout, _ = self.add_lag_features(holdout)
 
+        logger.info("Creating features: derivative (delta, delta_1s, accel per vital)")
         train, deriv_cols = self.add_derivative_features(train, lag_cols)
         test, _ = self.add_derivative_features(test, lag_cols)
         holdout, _ = self.add_derivative_features(holdout, lag_cols)
 
+        logger.info("Creating features: rolling_stats (mean/std/min/max over lag window)")
         train, rolling_cols = self.add_rolling_stats(train, lag_cols)
         test, _ = self.add_rolling_stats(test, lag_cols)
         holdout, _ = self.add_rolling_stats(holdout, lag_cols)
 
+        logger.info("Creating features: multiscale_rolling (mean/std/min/max per window)")
         train, multi_rolling_cols = self.add_multiscale_rolling_stats(train)
         test, _ = self.add_multiscale_rolling_stats(test)
         holdout, _ = self.add_multiscale_rolling_stats(holdout)
 
+        logger.info("Creating features: derived_vitals (pulse_pressure, map, shock_index, hr_rr_ratio)")
         train, derived_cols = self.add_derived_vitals(train)
         test, _ = self.add_derived_vitals(test)
         holdout, _ = self.add_derived_vitals(holdout)
 
+        logger.info("Creating features: temporal (minutes_into_encounter, hour/dow sin/cos)")
         train, temporal_cols = self.add_temporal_features(train)
         test, _ = self.add_temporal_features(test)
         holdout, _ = self.add_temporal_features(holdout)
 
+        logger.info("Creating features: ecg (stats + FFT: dom_freq, LF/HF, spectral_entropy, hr_ecg_diff)")
         train, ecg_cols = self.add_ecg_features(train, "train")
         test, _ = self.add_ecg_features(test, "test")
         holdout, _ = self.add_ecg_features(holdout, "holdout")
 
-        train, prior_cols = self.add_prior_label_features(train)
-        test, _ = self.add_prior_label_features(test)
-        holdout, _ = self.add_prior_label_features(holdout)
+        if include_prior_labels:
+            logger.info("Creating features: prior_label (prior_label, max_label_last_60s, ever_deteriorated)")
+            train, prior_cols = self.add_prior_label_features(train)
+            test, _ = self.add_prior_label_features(test)
+            holdout, _ = self.add_prior_label_features(holdout)
+        else:
+            prior_cols = []
 
+        logger.info("Creating features: patient (demographics, comorbidity, risk tier, OHE)")
         train_ids = set(train[self.encounter_id_col].unique())
         train, patient_cols = self.add_patient_features(
             train, patients, train_ids
         )
         test, _ = self.add_patient_features(test, patients, train_ids)
         holdout, _ = self.add_patient_features(holdout, patients, train_ids)
+
+        logger.info("Creating features: clinical_alert (tachycardia, hypotension, spo2_low, n_active_alerts)")
+        train, alert_cols = self.add_clinical_alert_features(train)
+        test, _ = self.add_clinical_alert_features(test)
+        holdout, _ = self.add_clinical_alert_features(holdout)
+
+        logger.info("Creating features: interaction (vital x elderly/child/comorbidity/cardiac_meds)")
+        train, interaction_cols = self.add_interaction_features(train)
+        test, _ = self.add_interaction_features(test)
+        holdout, _ = self.add_interaction_features(holdout)
+
+        logger.info("Creating features: higher_order_derivatives (jerk per vital)")
+        train, higher_deriv_cols = self.add_higher_order_derivatives(train)
+        test, _ = self.add_higher_order_derivatives(test)
+        holdout, _ = self.add_higher_order_derivatives(holdout)
 
         feature_cols = (
             self.vital_cols
@@ -736,5 +884,8 @@ class FeatureEngineer:
             + ecg_cols
             + prior_cols
             + patient_cols
+            + alert_cols
+            + interaction_cols
+            + higher_deriv_cols
         )
         return train, test, holdout, feature_cols
